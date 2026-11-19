@@ -56,6 +56,7 @@ async function cpanelApi2(module, func, params = {}) {
 function request(url, opts, body, api2 = false) {
   return new Promise((resolve) => {
     const lib = url.startsWith('https') ? require('https') : require('http');
+    if (body) opts.headers['Content-Length'] = Buffer.byteLength(body);
     const req = lib.request(url, { ...opts, rejectUnauthorized: CFG.verifySsl, timeout: 30000 }, (res) => {
       let data = '';
       res.on('data', (c) => (data += c));

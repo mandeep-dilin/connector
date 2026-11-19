@@ -8,7 +8,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod');
 
-const VERSION = 'connector-v1';
+const VERSION = 'connector-v2';
 
 // ---------------- Settings (environment variables) ----------------
 const env = (k, d = '') => (process.env[k] ?? d).trim();

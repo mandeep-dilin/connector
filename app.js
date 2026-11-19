@@ -74,7 +74,7 @@ function request(url, opts, body, api2 = false) {
       });
     });
     req.on('timeout', () => req.destroy(new Error('timeout')));
-    req.on('error', (e) => resolve({ ok: false, error: `Cannot reach cPanel API: ${e.message}` }));
+    req.on('error', (e) => resolve({ ok: false, error: `Cannot reach cPanel API at ${url.split('/execute')[0].split('/json-api')[0]}: ${e.code || ''} ${e.message || ''}` }));
     if (body) req.write(body);
     req.end();
   });
@@ -331,6 +331,8 @@ const httpServer = http.createServer(async (req, res) => {
         secret: CFG.secret.length >= 24, cpanel: Boolean(CFG.user && CFG.token), email: Boolean(CFG.mailUser && CFG.mailPass),
         writes: CFG.allowWrites,
       },
+      cpanel_url: CFG.cpanelUrl,
+      mail_host: `${CFG.mailHost}:${CFG.mailPort}`,
     });
   }
 

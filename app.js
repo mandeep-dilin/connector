@@ -297,6 +297,30 @@ function buildServer() {
       });
     }));
 
+  // --- TEST: can a cPanel user token reach WHM? (read-only) ---
+  tool('test_whm_access', 'TEST ONLY: try WHM API "applist" with this cPanel user token. Expected to be denied.',
+    {}, read, async () => {
+      const whmUrl = CFG.cpanelUrl.replace(':2083', ':2087') + '/json-api/applist?api.version=1';
+      const results = {};
+      for (const scheme of ['whm', 'cpanel']) {
+        const r = await new Promise((resolve) => {
+          const req = require('https').request(whmUrl, {
+            method: 'GET', rejectUnauthorized: false, timeout: 15000,
+            headers: { Authorization: `${scheme} ${CFG.user}:${CFG.token}` },
+          }, (res) => {
+            let d = '';
+            res.on('data', (c) => (d += c));
+            res.on('end', () => resolve({ http: res.statusCode, body: d.slice(0, 400) }));
+          });
+          req.on('error', (e) => resolve({ error: `${e.code || ''} ${e.message || ''}` }));
+          req.on('timeout', () => req.destroy(new Error('timeout')));
+          req.end();
+        });
+        results[scheme] = r;
+      }
+      return text(results);
+    });
+  
   return server;
 }
 

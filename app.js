@@ -93,7 +93,7 @@ async function withPrefix(name) {
 
 // ---------------- File path safety ----------------
 // Paths are relative to the home folder. Block going outside it and private folders.
-const BLOCKED_TOP = new Set(['etc', 'mail', 'ssl', 'tmp', 'logs', 'access-logs', 'perl5', 'cpanel3-skel']);
+const BLOCKED_TOP = new Set(['etc', 'mail', 'ssl', 'tmp', 'logs', 'access-logs', 'perl5', 'cpanel3-skel', 'ea-podman.d']);
 function safePath(p) {
   const parts = String(p || '').replace(/\\/g, '/').split('/').filter((s) => s && s !== '.');
   if (parts.some((s) => s === '..')) throw new Error('Path may not contain ".."');

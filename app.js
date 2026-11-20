@@ -8,7 +8,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod');
 
-const VERSION = 'connector-v2';
+const VERSION = 'connector-v5';
 
 // ---------------- Settings (environment variables) ----------------
 const env = (k, d = '') => (process.env[k] ?? d).trim();
@@ -168,7 +168,7 @@ function buildServer() {
     { path: z.string().describe('Folder relative to home, e.g. "public_html" or "shop.example.com"') }, read,
     async ({ path }) => {
       const { full } = safePath(path);
-      const r = await cpanel('Fileman', 'list_files', { dir: full, include_mime: 0 }, 'GET');
+      const r = await cpanel('Fileman', 'list_files', { dir: full, include_mime: 0, show_hidden: 1 }, 'GET');
       if (!r.ok) return fail(r.error);
       return text((r.data || []).slice(0, 300).map((f) => ({ name: f.file, type: f.type, size: f.size, modified: f.mtime ? new Date(f.mtime * 1000).toISOString().slice(0, 16) : '' })));
     });
@@ -238,6 +238,18 @@ function buildServer() {
       const g = await cpanel('Mysql', 'set_privileges_on_database', { user: u, database: db, privileges: 'ALL PRIVILEGES' });
       if (!g.ok) return fail(`User ${u} created, but giving access failed: ${g.error}`);
       return text({ user: u, password: pass, database: db, host: 'localhost' });
+    });
+
+  tool('change_db_password', 'Change the password of a MySQL user. If no password is given, a strong random one is generated. Returns the new password.',
+    {
+      user: z.string().describe('MySQL user, e.g. "envuser" (prefix added automatically)'),
+      password: z.string().min(8).optional().describe('New password. Leave empty to generate a strong one.'),
+    }, write,
+    async ({ user, password }) => {
+      const u = await withPrefix(user);
+      const pass = password || (crypto.randomBytes(18).toString('base64').replace(/[+/=]/g, 'x') + '#9A');
+      const r = await cpanel('Mysql', 'set_password', { user: u, password: pass });
+      return r.ok ? text({ user: u, password: pass }) : fail(r.error);
     });
 
   // --- Git ---
@@ -320,7 +332,179 @@ function buildServer() {
       }
       return text(results);
     });
-  
+
+  // ================= v5 additions =================
+
+  // --- MySQL: tables and SQL (connects directly to MySQL with a database user's login) ---
+  const MYSQL_HOST = env('MYSQL_HOST', 'host.containers.internal');
+  const DESTRUCTIVE = /^\s*(drop|delete|truncate|rename)\b|\balter\b[\s\S]*\bdrop\b/i;
+  async function withMysql({ database, db_user, db_password }, fn) {
+    const mysql = require('mysql2/promise');
+    let conn;
+    try {
+      conn = await mysql.createConnection({
+        host: MYSQL_HOST, port: 3306, user: await withPrefix(db_user), password: db_password,
+        database: await withPrefix(database), connectTimeout: 10000, multipleStatements: false,
+      });
+    } catch (e) {
+      const m = String(e.message).match(/'[^']*'@'([^']+)'/) || String(e.message).match(/Host '([^']+)'/);
+      const hint = m ? ` MySQL saw this connector as host "${m[1]}". If the login is correct, allow that host with add_mysql_access_host.` : '';
+      throw new Error(`MySQL login failed: ${e.message}.${hint}`);
+    }
+    try { return await fn(conn); } finally { await conn.end().catch(() => {}); }
+  }
+  const dbLogin = {
+    database: z.string().describe('Database name (prefix added automatically)'),
+    db_user: z.string().describe('MySQL user with access to that database (e.g. from the site .env)'),
+    db_password: z.string().describe('That MySQL user\'s password'),
+  };
+
+  tool('add_mysql_access_host', 'Allow MySQL logins from an extra host (cPanel Remote MySQL). Needed once so this connector can run SQL. Use the host shown in a MySQL login error.',
+    { host: z.string().describe('IP or host, e.g. "10.88.0.5" or "10.88.0.%"') }, write,
+    async ({ host }) => out(await cpanel('Mysql', 'add_host', { host })));
+
+  tool('list_tables', 'List the tables in a database with row counts and size.',
+    dbLogin, read,
+    async (a) => withMysql(a, async (c) => {
+      const [rows] = await c.query('SHOW TABLE STATUS');
+      return text(rows.map((t) => ({ table: t.Name, rows: t.Rows, size_kb: Math.round(((t.Data_length || 0) + (t.Index_length || 0)) / 1024), created: t.Create_time })));
+    }));
+
+  tool('run_sql', 'Run ONE SQL statement on a database (SELECT, INSERT, UPDATE, CREATE TABLE...). DROP, DELETE, TRUNCATE and RENAME are refused unless confirm_destructive is true, which you may only set after the user clearly confirms in chat.',
+    {
+      ...dbLogin,
+      sql: z.string().describe('One SQL statement'),
+      confirm_destructive: z.boolean().optional().describe('Only true after the user explicitly confirmed a destructive statement'),
+    }, write,
+    async ({ sql, confirm_destructive, ...login }) => {
+      if (DESTRUCTIVE.test(sql) && !confirm_destructive) {
+        return fail('This statement deletes or drops data. Ask the user to confirm first, then retry with confirm_destructive: true.');
+      }
+      return withMysql(login, async (c) => {
+        const [res] = await c.query(sql);
+        if (Array.isArray(res)) return text({ rows: res.length, data: res.slice(0, 200), cut: res.length > 200 });
+        return text({ affected_rows: res.affectedRows, insert_id: res.insertId || undefined, info: res.info || undefined });
+      });
+    });
+
+  // --- Email accounts and autoresponders ---
+  tool('create_email_account', 'Create an email account. A strong password is generated and returned.',
+    {
+      email: z.string().describe('Part before @, e.g. "info"'),
+      domain: z.string().describe('Domain on this account, e.g. "example.com"'),
+      quota_mb: z.number().int().min(0).optional().describe('Mailbox size limit in MB, 0 = unlimited. Default 1024.'),
+    }, write,
+    async ({ email, domain, quota_mb = 1024 }) => {
+      const pass = crypto.randomBytes(15).toString('base64').replace(/[+/=]/g, 'x') + '#7a';
+      const r = await cpanel('Email', 'add_pop', { email, domain, password: pass, quota: quota_mb });
+      return r.ok ? text({ email: `${email}@${domain}`, password: pass, quota_mb }) : fail(r.error);
+    });
+
+  tool('list_autoresponders', 'List autoresponders for a domain.',
+    { domain: z.string() }, read,
+    async ({ domain }) => out(await cpanel('Email', 'list_auto_responders', { domain }, 'GET')));
+
+  tool('set_autoresponder', 'Create or update an autoresponder (automatic reply) for an email address.',
+    {
+      email: z.string().describe('Part before @, e.g. "info"'),
+      domain: z.string(),
+      from: z.string().describe('Sender name shown on the reply'),
+      subject: z.string(),
+      body: z.string().describe('Reply text'),
+      interval_hours: z.number().int().min(0).optional().describe('Hours before replying again to the same sender. Default 24.'),
+      start: z.string().optional().describe('Start date/time (ISO, e.g. 2026-11-21T09:00:00+05:30). Default now.'),
+      stop: z.string().optional().describe('Stop date/time (ISO). Leave empty for no end.'),
+    }, write,
+    async ({ email, domain, from, subject, body, interval_hours = 24, start, stop }) => {
+      const p = {
+        email, domain, from, subject, body, is_html: 0, charset: 'utf-8', interval: interval_hours,
+        start: Math.floor((start ? new Date(start) : new Date()).getTime() / 1000),
+      };
+      if (stop) p.stop = Math.floor(new Date(stop).getTime() / 1000);
+      return out(await cpanel('Email', 'add_auto_responder', p));
+    });
+
+  // --- Cron jobs (run on the real server as this cPanel user, in the server's time zone) ---
+  tool('list_cron_jobs', 'List this account\'s cron jobs (scheduled commands). Times are in the server\'s time zone.',
+    {}, read,
+    async () => {
+      const r = await cpanelApi2('Cron', 'listcron');
+      if (!r.ok) return fail(r.error);
+      return text((r.data || []).filter((j) => j.command).map((j) => ({
+        linekey: j.linekey, minute: j.minute, hour: j.hour, day: j.day, month: j.month, weekday: j.weekday, command: j.command,
+      })));
+    });
+
+  tool('add_cron_job', 'Add a cron job. Runs on the real server as this cPanel user (not in this container). Times are in the server\'s time zone (check with server_time).',
+    {
+      minute: z.string().describe('0-59 or *'), hour: z.string().describe('0-23 or *'),
+      day: z.string().describe('1-31 or *'), month: z.string().describe('1-12 or *'), weekday: z.string().describe('0-6 (0=Sunday) or *'),
+      command: z.string().describe('Command to run, e.g. "/usr/local/bin/php /home/user/public_html/blog/publish.php"'),
+    }, write,
+    async (a) => {
+      const r = await cpanelApi2('Cron', 'add_line', a);
+      return r.ok ? text({ added: a }) : fail(r.error);
+    });
+
+  tool('remove_cron_job', 'Remove one cron job by its linekey (from list_cron_jobs).',
+    { linekey: z.string() }, { readOnlyHint: false, destructiveHint: true },
+    async ({ linekey }) => {
+      const r = await cpanelApi2('Cron', 'remove_line', { linekey });
+      return r.ok ? text({ removed: linekey }) : fail(r.error);
+    });
+
+  tool('server_time', 'Current date/time and time zone, as seen by this connector, plus Sri Lanka time.',
+    {}, read, async () => text({
+      utc: new Date().toISOString(),
+      container_local: new Date().toString(),
+      sri_lanka: new Date().toLocaleString('en-GB', { timeZone: 'Asia/Colombo' }),
+      note: 'Cron jobs use the real server\'s time zone. To check it, add a cron job that writes `date` to a file and read the file.',
+    }));
+
+  // --- SSL ---
+  tool('ssl_status', 'Installed SSL certificates per domain: issuer, expiry date, days left.',
+    {}, read,
+    async () => {
+      const r = await cpanel('SSL', 'installed_hosts', {}, 'GET');
+      if (!r.ok) return fail(r.error);
+      const now = Date.now() / 1000;
+      return text((r.data || []).map((h) => {
+        const c = h.certificate || {};
+        return {
+          domains: c.domains || h.domains, issuer: c.issuer_organizationName || c['issuer.organizationName'],
+          expires: c.not_after ? new Date(c.not_after * 1000).toISOString().slice(0, 10) : null,
+          days_left: c.not_after ? Math.floor((c.not_after - now) / 86400) : null,
+        };
+      }));
+    });
+
+  // --- TEST: fixed check commands inside this app's own container ---
+  const CHECKS = {
+    whoami: ['whoami'], id: ['id'], nproc: ['nproc'], uname: ['uname', '-a'], date: ['date'],
+    os_release: ['cat', '/etc/os-release'], uptime: ['uptime'], memory: ['free', '-m'], disk: ['df', '-h'],
+    processes: ['ps', 'aux'], root_folder: ['ls', '-la', '/'], home_folder: ['ls', '-la', HOME],
+    network: ['cat', '/etc/hosts'],
+    httpd_status: ['systemctl', 'status', 'httpd', '--no-pager'], cpanel_status: ['systemctl', 'status', 'cpanel', '--no-pager'],
+  };
+  tool('run_check', 'TEST: run one fixed, read-only check command inside the connector app container. Allowed: ' + Object.keys(CHECKS).join(', '),
+    { check: z.enum(Object.keys(CHECKS)) }, read,
+    async ({ check }) => {
+      const { execFile } = require('child_process');
+      const [cmd, ...args] = CHECKS[check];
+      return text(await new Promise((resolve) => {
+        execFile(cmd, args, { timeout: 10000, maxBuffer: 200000 }, (err, stdout, stderr) => resolve({
+          command: [cmd, ...args].join(' '), exit_code: err ? (err.code ?? 'error') : 0,
+          output: String(stdout || '').slice(0, 6000), error: String(stderr || (err && err.message) || '').slice(0, 2000),
+        }));
+      }));
+    });
+
+  tool('server_info', 'Server details cPanel shares with this user: hostname, OS, kernel, Apache/PHP/MySQL versions.',
+    {}, read, async () => out(await cpanel('Variables', 'get_server_information', {}, 'GET')));
+
+  tool('service_status', 'Status of server services (Apache, MySQL, mail, FTP...) as cPanel shows it to this user.',
+    {}, read, async () => out(await cpanel('ServerInformation', 'get_information', {}, 'GET')));
+
   return server;
 }
 

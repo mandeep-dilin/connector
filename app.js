@@ -8,7 +8,7 @@ const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js');
 const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js');
 const { z } = require('zod');
 
-const VERSION = 'connector-v5';
+const VERSION = 'connector-v6';
 
 // ---------------- Settings (environment variables) ----------------
 const env = (k, d = '') => (process.env[k] ?? d).trim();
@@ -25,6 +25,63 @@ const CFG = {
   mailPort: Number(env('MAIL_PORT', '993')),
 };
 const PORT = process.env.PORT || 3000;
+
+// ---------------- Action log ----------------
+// One JSON line per event in logs/actions.log (inside the app folder, which the file tools cannot reach).
+const fs = require('fs');
+const pathMod = require('path');
+const LOG_DIR = pathMod.join(__dirname, 'logs');
+const LOG_FILE = pathMod.join(LOG_DIR, 'actions.log');
+const LOG_MAX_BYTES = 5 * 1024 * 1024;
+const LOG_PASSWORD = (process.env.LOG_PASSWORD || '').trim();
+const CLAUDE_RANGES = (process.env.CLAUDE_IP_RANGES || '160.79.104.0/21').split(',').map((s) => s.trim()).filter(Boolean);
+const SECRET_KEYS = /pass|secret|token|key/i;
+
+function ipInCidr(ip, cidr) {
+  const [range, bits] = cidr.split('/');
+  const toNum = (x) => x.split('.').reduce((a, o) => (a << 8) + (Number(o) & 255), 0) >>> 0;
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(ip) || !/^\d+\.\d+\.\d+\.\d+$/.test(range)) return false;
+  const mask = bits === undefined ? 0xffffffff : (~0 << (32 - Number(bits))) >>> 0;
+  return (toNum(ip) & mask) === (toNum(range) & mask);
+}
+const isClaudeIp = (ip) => CLAUDE_RANGES.some((c) => ipInCidr(ip, c));
+
+function clientIp(req) {
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return (xff || String(req.headers['x-real-ip'] || '') || req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+}
+
+// Hide passwords, shorten long text (like file content) before logging
+function redact(args) {
+  const out = {};
+  for (const [k, v] of Object.entries(args || {})) {
+    if (SECRET_KEYS.test(k)) out[k] = '***';
+    else if (typeof v === 'string' && v.length > 200) out[k] = `${v.slice(0, 120)}… (${v.length} chars)`;
+    else out[k] = v;
+  }
+  return out;
+}
+
+function writeLog(entry) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    try {
+      if (fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) fs.renameSync(LOG_FILE, LOG_FILE + '.1');
+    } catch {}
+    fs.appendFileSync(LOG_FILE, JSON.stringify({ time: new Date().toISOString(), ...entry }) + '\n');
+  } catch (e) {
+    console.error('log write failed:', e.message);
+  }
+}
+
+function readLog(limit = 500) {
+  const lines = [];
+  for (const f of [LOG_FILE, LOG_FILE + '.1']) {
+    try { lines.push(...fs.readFileSync(f, 'utf8').trim().split('\n').reverse()); } catch {}
+    if (lines.length >= limit) break;
+  }
+  return lines.slice(0, limit).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+}
 const HOME = `/home/${CFG.user}`;
 
 // ---------------- cPanel API ----------------
@@ -139,13 +196,24 @@ const safe = (fn) => async (args) => {
 };
 
 // ---------------- MCP server with tools ----------------
-function buildServer() {
+function buildServer(reqInfo = {}) {
   const server = new McpServer({ name: 'cpanel-connector', version: VERSION });
   const read = { readOnlyHint: true };
   const write = { readOnlyHint: false, destructiveHint: false };
   const tool = (name, desc, schema, annotations, fn) => {
     if (!annotations.readOnlyHint && !CFG.allowWrites) return;
-    server.registerTool(name, { description: desc, inputSchema: schema, annotations }, safe(fn));
+    const run = safe(fn);
+    server.registerTool(name, { description: desc, inputSchema: schema, annotations }, async (args) => {
+      const t0 = Date.now();
+      const result = await run(args);
+      const errText = result && result.isError ? String(result.content?.[0]?.text || '').slice(0, 300) : undefined;
+      writeLog({
+        type: 'tool', tool: name, write: !annotations.readOnlyHint, args: redact(args),
+        ok: !(result && result.isError), error: errText, ms: Date.now() - t0,
+        ip: reqInfo.ip, claude_ip: reqInfo.ip ? isClaudeIp(reqInfo.ip) : undefined, agent: reqInfo.agent,
+      });
+      return result;
+    });
   };
 
   // --- Account ---
@@ -529,10 +597,101 @@ function secretOk(given) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+const LOG_PAGE = String.raw`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connector log</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, Arial, sans-serif; background: #0f1115; color: #e8eaf0; padding: 16px; }
+  h1 { font-size: 18px; margin: 0 0 4px; } .muted { color: #8b90a0; font-size: 13px; }
+  .bar { display: flex; gap: 8px; flex-wrap: wrap; margin: 14px 0; align-items: center; }
+  select, input, button { font: inherit; font-size: 13px; padding: 7px 10px; border-radius: 8px; border: 1px solid #2a2f3a; background: #171a21; color: #e8eaf0; }
+  .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .stat { background: #171a21; border: 1px solid #2a2f3a; border-radius: 10px; padding: 8px 12px; font-size: 13px; }
+  .stat b { font-size: 18px; display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid #222631; vertical-align: top; }
+  th { color: #8b90a0; font-weight: 500; position: sticky; top: 0; background: #0f1115; }
+  .ok { color: #22c55e; } .bad { color: #ef4444; } .warn { color: #f59e0b; }
+  .pill { font-size: 11px; padding: 2px 7px; border-radius: 999px; font-weight: 600; white-space: nowrap; }
+  .p-read { background: #1e293b; color: #93c5fd; } .p-write { background: #3b2a12; color: #fbbf24; }
+  .p-claude { background: #14321f; color: #4ade80; } .p-other { background: #3a1414; color: #f87171; }
+  code { font-size: 12px; color: #c3c7d1; word-break: break-all; }
+  .wrap { overflow-x: auto; }
+</style></head><body>
+<h1>Connector action log</h1>
+<div class="muted">Every tool used through the connector, newest first. Passwords are hidden. Refreshes every 30s.</div>
+<div class="stats" id="stats"></div>
+<div class="bar">
+  <select id="f"><option value="all">Everything</option><option value="writes">Changes only</option><option value="errors">Errors only</option><option value="security">Security (bad secrets / logins)</option><option value="other_ip">Not from Claude's IP range</option></select>
+  <input id="q" placeholder="Search tool, path, IP…">
+  <button id="r">Refresh</button>
+  <span class="muted" id="when"></span>
+</div>
+<div class="wrap"><table><thead><tr><th>Time (Sri Lanka)</th><th>What</th><th>Details</th><th>Result</th><th>From</th></tr></thead><tbody id="rows"></tbody></table></div>
+<script>
+  var data = [];
+  var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); };
+  function t(s) { return new Date(s).toLocaleString('en-GB', { timeZone: 'Asia/Colombo', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
+  function render() {
+    var f = document.getElementById('f').value, q = document.getElementById('q').value.toLowerCase();
+    var list = data.filter(function (e) {
+      if (f === 'writes' && !(e.type === 'tool' && e.write)) return false;
+      if (f === 'errors' && !(e.type === 'tool' && !e.ok)) return false;
+      if (f === 'security' && e.type === 'tool') return false;
+      if (f === 'other_ip' && e.claude_ip !== false) return false;
+      return !q || JSON.stringify(e).toLowerCase().indexOf(q) >= 0;
+    });
+    var tools = data.filter(function (e) { return e.type === 'tool'; });
+    document.getElementById('stats').innerHTML =
+      '<div class="stat"><b>' + tools.length + '</b>tool uses</div>' +
+      '<div class="stat"><b>' + tools.filter(function (e) { return e.write; }).length + '</b>changes</div>' +
+      '<div class="stat"><b class="bad">' + tools.filter(function (e) { return !e.ok; }).length + '</b>errors</div>' +
+      '<div class="stat"><b class="warn">' + data.filter(function (e) { return e.type !== 'tool'; }).length + '</b>security events</div>' +
+      '<div class="stat"><b class="bad">' + data.filter(function (e) { return e.claude_ip === false; }).length + '</b>not from Claude IPs</div>';
+    document.getElementById('rows').innerHTML = list.map(function (e) {
+      var what, details, result;
+      if (e.type === 'tool') {
+        what = '<b>' + esc(e.tool) + '</b> <span class="pill ' + (e.write ? 'p-write">change' : 'p-read">read') + '</span>';
+        details = '<code>' + esc(JSON.stringify(e.args)) + '</code>';
+        result = e.ok ? '<span class="ok">OK</span> <span class="muted">' + e.ms + 'ms</span>' : '<span class="bad">Error</span><br><code>' + esc(e.error) + '</code>';
+      } else if (e.type === 'bad_secret') {
+        what = '<b class="warn">Wrong connector secret</b>'; details = '<code>tried ' + esc(e.tried) + ' · ' + esc(e.agent) + '</code>'; result = '<span class="bad">Blocked</span>';
+      } else {
+        what = '<b class="warn">Wrong log password</b>'; details = ''; result = '<span class="bad">Blocked</span>';
+      }
+      var from = esc(e.ip || '?') + (e.claude_ip === true ? ' <span class="pill p-claude">Claude</span>' : e.claude_ip === false ? ' <span class="pill p-other">other</span>' : '');
+      return '<tr><td style="white-space:nowrap">' + t(e.time) + '</td><td>' + what + '</td><td>' + details + '</td><td>' + result + '</td><td>' + from + '</td></tr>';
+    }).join('') || '<tr><td colspan="5" class="muted">Nothing here yet.</td></tr>';
+  }
+  function load() {
+    fetch('/log/data', { cache: 'no-store' }).then(function (r) { return r.json(); }).then(function (d) {
+      data = d; render(); document.getElementById('when').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    });
+  }
+  document.getElementById('f').onchange = render; document.getElementById('q').oninput = render; document.getElementById('r').onclick = load;
+  load(); setInterval(load, 30000);
+</script></body></html>`;
+
 const httpServer = http.createServer(async (req, res) => {
   const path = new URL(req.url, 'http://x').pathname.replace(/\/+$/, '');
 
   // Public status page (no secrets shown)
+  if (path === '/log' || path === '/log/data') {
+    if (LOG_PASSWORD.length < 8) return send(res, 404, { error: 'Not found' });
+    const auth = String(req.headers.authorization || '');
+    const given = auth.startsWith('Basic ') ? Buffer.from(auth.slice(6), 'base64').toString().split(':').slice(1).join(':') : '';
+    const a = Buffer.from(given), b = Buffer.from(LOG_PASSWORD);
+    if (!(a.length === b.length && crypto.timingSafeEqual(a, b))) {
+      if (given) writeLog({ type: 'bad_log_login', ip: clientIp(req) });
+      res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Connector log"', 'Content-Type': 'text/plain' });
+      return res.end('Login required');
+    }
+    if (path === '/log/data') return send(res, 200, readLog(1000));
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(LOG_PAGE);
+  }
+
   if (path === '' || path === '/' || path.endsWith('/health')) {
     return send(res, 200, {
       status: 'ok', version: VERSION, node: process.version,
@@ -547,7 +706,13 @@ const httpServer = http.createServer(async (req, res) => {
 
   // MCP endpoint: /mcp/<CONNECTOR_SECRET>
   const m = path.match(/\/mcp\/([^/]+)$/);
-  if (!m || !secretOk(m[1])) return send(res, 404, { error: 'Not found' });
+  if (!m || !secretOk(m[1])) {
+    if (m) {
+      const ip = clientIp(req);
+      writeLog({ type: 'bad_secret', ip, claude_ip: isClaudeIp(ip), tried: m[1].slice(0, 4) + '…', agent: String(req.headers['user-agent'] || '').slice(0, 120) });
+    }
+    return send(res, 404, { error: 'Not found' });
+  }
 
   if (req.method !== 'POST') {
     return send(res, 405, { jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
@@ -555,7 +720,7 @@ const httpServer = http.createServer(async (req, res) => {
 
   try {
     const body = await readBody(req);
-    const server = buildServer();
+    const server = buildServer({ ip: clientIp(req), agent: String(req.headers['user-agent'] || '').slice(0, 120) });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { transport.close(); server.close(); });
     await server.connect(transport);
